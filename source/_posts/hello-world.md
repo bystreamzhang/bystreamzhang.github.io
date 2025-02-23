@@ -35,4 +35,7 @@ More info: [Generating](https://hexo.io/docs/generating.html)
 $ hexo deploy
 ```
 
+注：我已经配置了github actions，不需要本地运行deploy，只需要push就会自动部署。
+如果出现问题，在github的actions部分可以查看并重新构建部署。
+
 More info: [Deployment](https://hexo.io/docs/one-command-deployment.html)
