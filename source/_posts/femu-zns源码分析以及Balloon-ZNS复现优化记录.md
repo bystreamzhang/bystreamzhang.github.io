@@ -4,9 +4,6 @@ date: 2025-02-23 17:12:58
 tags:
 ---
 
-<link rel="stylesheet" type="text/css" href="../css-ex/auto-number-title.css" />
-<link rel="stylesheet" type="text/css" href="/css-ex/auto-number-title.css" />
-
 # 说明
 
 本文为做毕设项目时的笔记。
