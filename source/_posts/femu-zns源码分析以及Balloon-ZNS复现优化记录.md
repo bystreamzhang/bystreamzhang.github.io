@@ -3,7 +3,7 @@ title: FEMU模拟的ZNS源码分析以及Balloon-ZNS复现优化记录
 date: 2025-02-23 17:12:58
 tags:
 ---
-<link rel="stylesheet" type="text/css" href="../../css/auto-number-title.css" />
+
 <link rel="stylesheet" type="text/css" href="../css/auto-number-title.css" />
 <link rel="stylesheet" type="text/css" href="/css/auto-number-title.css" />
 
