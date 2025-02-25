@@ -10,54 +10,101 @@ categories: Study
 
 # 说明
 
-本文为做毕设项目时的笔记。
+本文为做毕设项目时的笔记.
 
 [FEMU官方文档](https://github.com/MoatLab/FEMU)
-主体代码在hw/femu。
+主体代码在hw/femu.
 代码分析可参考[0 FEMU 简介 | ["FEMU闪存仿真平台介绍及使用文档"]](https://nnss-hascode.github.io/FEMU-Doc/FEMU-Doc.html)
 
 [FEMU论文](https://www.usenix.org/conference/fast18/presentation/li)  
 [Balloon-ZNS论文](https://dl.acm.org/doi/10.1145/3649329.3657368)
 
-主要分析代码：hw/femu/zns下的代码。
+主要分析代码：hw/femu/zns下的代码.
 
-暂不分析所有源码，主要是对Balloon-ZNS在ZNS上有所改动的地方进行分析说明，记录我当前的改动方法。（后续可能修改）
+暂不分析所有源码, 主要是对Balloon-ZNS在ZNS上有所改动的地方进行分析说明, 记录我当前的改动方法.（后续可能修改）
 
-有两个读写、延迟计算相关的核心函数需要特别关注：`zns.c::zns_nvme_rw`, `zftl.c::zns_wc_flush`。
+有两个读写、延迟计算相关的核心函数需要特别关注：`zns.c::zns_nvme_rw`, `zftl.c::zns_wc_flush`.
 
 ## 核心函数说明
 
-这里先只说明femu模拟的原版zns。
+这里先只说明femu模拟的原版zns.
 
 ### zns.c::zns_nvme_rw
 
 此函数的工作主要分以下几步：
 
-1. 从传入的请求req中获取start logical block address(slba)以及number of logical block(nlb)，以及请求是读or写。
+1. 从传入的请求req中获取start logical block address(slba)以及number of logical block(nlb), 以及请求是读or写.
 
-> 关于lb：逻辑块是比逻辑页还小的单位，一个lb为512B。lb是`zone->w_ptr`、`zone->d.wp`、`n->zone_size`等变量的单位。
+> 关于lb：逻辑块是比逻辑页还小的单位, 一个lb为512B.lb是`zone->w_ptr`、`zone->d.wp`、`n->zone_size`等变量的单位.
 >
-> lba不是以字节为单位，而是以lb为单位。slba=524288代表第524288个lb。可以通过函数转为具体字节地址。
+> lba不是以字节为单位, 而是以lb为单位.slba=524288代表第524288个lb.可以通过函数转为具体字节地址.
 
-2. 根据slba获得对应zone指针(使用`zns_get_zone_by_slba`函数)。
-3. 通过`zns_check_zone_write`等函数初步检查这个请求是否合法，比如zone是否装得下nlb个lb。
-4. 通过slba获得具体要读/写的内存逻辑地址。
-5. 从req获取QEMUSGList信息，包括每个sg的长度和总数量。
-6. 打包既有信息调用`backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);`函数进行实际的读/写。
-7. 对于写操作，检查zns的新状态。
-8. 更改`n->zns->active_zone`为slba对应的zone的编号。
+2. 根据slba获得对应zone指针(使用`zns_get_zone_by_slba`函数).
+3. 通过`zns_check_zone_write`等函数初步检查这个请求是否合法, 比如zone是否装得下nlb个lb.
+4. 通过slba获得具体要读/写的内存逻辑地址.
+5. 从req获取QEMUSGList信息, 包括每个sg的长度和总数量.
+6. 打包既有信息调用`backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);`函数进行实际的读/写.
+7. 对于写操作, 检查zns的新状态.
+8. 更改`n->zns->active_zone`为slba对应的zone的编号.
 
 ### zftl.c::zns_wc_flush
 
+此函数会在某个写缓存满的时候调用.调用时会传入一个wcidx并且整个函数就是处理这个写缓存.
+
 此函数的工作主要分以下几步：
 
-1. 
+1. 枚举写缓存wcidx的逻辑页编号i, 进入i循环, 执行下面的2~13
+2. 枚举zns的plane编号p, 进入p循环, 执行下面的3~12
+3. 调用`get_new_page`函数获取一个物理页地址ppa(此时其信息取决于zns的当前写指针wp以及active zone的值.wp会决定物理页的channel和lun, active zone的值会给予blk).将ppa的plane设为p.
+4. 根据闪存类型(SLC1, MLC2, TLC3, QLC4,femu设置是4)进入j循环, 重复j次下面的操作5~11
+5. ppa的page设为`get_blk(zns,&ppa)->page_wp`, 也就是获取其blk的page_wp.然后其page_wp++.
+6. 根据`ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE`的值枚举子页subpage, 进入subpage循环, 以下7~10为循环内容
+7. 根据wcidx, i, subpage获得lpn
+8. 通过lpn, 调用`get_maptbl_ent`函数获得oldppa, 检查这个oldppa是否映射过, 如果映射过可能需要额外处理
+9. 将ppa的spg设为subpage
+10. 调用`set_maptbl_ent(zns, lpn, &ppa)`, 建立lpn和ppa之间的映射.(对于femu模拟器代码, 内部就是执行`zns->maptbl[lpn] = *ppa;`)
+11. 退出subpage循环后, i自增`ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE`
+12. 退出j循环后, 根据ppa调用`zns_advance_status`计算sublat, maxlat来更新模拟的延迟值
+13. 退出p循环后, 调用`zns_advance_write_pointer`使zns的写指针前进
+14. 退出i循环后, 重设写缓存wcidx的used值为0, 返回maxlat
+
+细节说明：
+
+枚举的i是逻辑页编号, 对应逻辑页大小是`LOGICAL_PAGE_SIZE`(4KB).通过get_new_page获得的ppa是物理页地址, 对应物理页大小是`ZNS_PAGE_SIZE`(16KB).
+
+假设写缓存有100个, num_plane=2, flash_type=4, 物理页大小是逻辑页大小的4倍也就是说subpage=4, 那么首先, 对于第0个逻辑页, 获取一个新物理页ppa.
+ppa的plane设定为0, 然后ppa的pg变成其blk的page_wp, 然后其page_wp加1,
+然后对于这第0个以及后面的总共4个逻辑页, 取出lpn, ppa记录当前逻辑页的subpage编号, 然后将该逻辑页lpn映射到当前ppa.
+然后逻辑页编号变成4. 4~7号逻辑页同样会使ppa的pg改变并使对应blk的page_wp加1, 从映射结果上看4~7号逻辑页也是映射到与之前相同的物理页ppa.8~11和12~15应该也是.
+
+也就是说通过`get_new_page`获取的一个物理页在这种假设下可以容纳`4*4=16`个逻辑页, 其pg和spg属性分别有4种值构成了这16种情况(pg的4个值是ppa的blk本身page_wp往后的4个值,而spg的4个值就是0~3).
+
+在ppa的结构体中(见zns.h),各个属性的域都是规定好的,比如spg就只有2位,表示范围是0~3. 如果物理页大小是逻辑页的16倍,spg就应该有4位.
+
+然后对于i=16~31, 轮到下一个plane的一个新物理页ppa.所有plane做完以后, 使zns的wp前进, 改变channel或lun.然后又回到plane0.
+
+这里的做法应该是为了利用plane的并行性, 这种写法下, 每次都是从plane0开始, 处理完所有plane再进行wp的前进, 获取的物理页ppa的属性只和zns的wp和active zone有关, 
+代码应该是保证了每个plane获取的ppa都属于同一个channel、die并且有一样的blk, 这样不同plane之间就可以并行, 因为同编号的channel, die和blk可以并行.
+这里的并行是模拟的,代码中体现为,每个plane有一个独立的`next_plane_avail_time`,类似计时器,会分别记录延迟,并且取最大值作为要输出的延迟maxlat. 
+如果串行则他们的延迟就要累加而非取最值.
+可参考 [SSD基础架构与NAND IO并发问题探讨](https://blog.csdn.net/zhuzongpeng/article/details/134915562)  和
+ [论文阅读：SSD内部多级并行性的探索和利用（TOC 2013）](http://cighao.com/2016/07/20/paper-reading-02-the-multilevel-parallelism-inside-SSDs/) 
+
+femu模拟的zns代码中, 除了plane以外的blk,fc,ch等层次的结构体也都有一个计时器,但是只有plane的计时器被使用了,所以其他层次的并行性体现在哪里?
+
+## 并行性
+
+前面讨论`zns_wc_flush`函数时说明了plane级别的并行性体现. 这里讨论其他层次的并行性.
+
+![](1.drawio.png) 111
+
+![](./femu-zns源码分析以及Balloon-ZNS复现优化记录/1.drawio.png) 222
 
 ## 子超级块相关
 
 ### 宏
 
-这里模拟器设定die数量为4，我规定一个超级块有4个子超级块。
+这里模拟器设定die数量为4, 我规定一个超级块有4个子超级块.
 
 ```c
 #define SUPERBLOCK_TO_SUBSUPERBLOCK_RATIO 4
@@ -65,9 +112,9 @@ categories: Study
 
 ### 结构体
 
-此处代码均在zns.h。
+此处代码均在zns.h.
 
-超级块本身没有结构体，zns的写缓存会记录当前超级块的id。
+超级块本身没有结构体, zns的写缓存会记录当前超级块的id.
 
 ```c 
 struct zns_write_cache{
@@ -137,7 +184,7 @@ typedef struct NvmeZone {
 
 ##### 获取物理页
 
-原版就是获取zns的当前写指针，从中获取物理页的各种信息，包括channel、flash chip(die)、block等。这里并没有设定好ppa的所有信息，比如没有设定plane、page、subpage，这些会在后续设定 (见`zftl.c::zns_wc_flush`)。
+原版就是获取zns的当前写指针, 从中获取物理页的各种信息, 包括channel、flash chip(die)、block等.这里并没有设定好ppa的所有信息, 比如没有设定plane、page、subpage, 这些会在后续设定 (见`zftl.c::zns_wc_flush`).
 
 ```c
 static struct ppa get_new_page(struct zns_ssd *zns)
@@ -158,7 +205,7 @@ static struct ppa get_new_page(struct zns_ssd *zns)
 }
 ```
 
-balloon-zns版本如下。
+balloon-zns版本如下.
 
 ```c
 // add by znbc
@@ -212,11 +259,11 @@ struct write_pointer_bz {
 #endif
 ```
 
-本来，只需要wp和active_zone的信息就可以完成get_new_page函数，程序运行时写指针wp就不断前进并在不同的ch和lun(die)跳跃，模拟并行，
-而blk就是zns的当前活跃zone编号。
+本来, 只需要wp和active_zone的信息就可以完成get_new_page函数, 程序运行时写指针wp就不断前进并在不同的ch和lun(die)跳跃, 模拟并行, 
+而blk就是zns的当前活跃zone编号.
 
-现在引入子超级块以后，一个zone的block未必覆盖所有die所以wp不能顺序跳跃，zone和block也不再对应，die0的block0和die2的block0可能属于不同的zone。
-所以现在需要知道子超级块编号才能知道die和blk的值，才能完成get_new_page函数。
+现在引入子超级块以后, 一个zone的block未必覆盖所有die所以wp不能顺序跳跃, zone和block也不再对应, die0的block0和die2的block0可能属于不同的zone.
+所以现在需要知道子超级块编号才能知道die和blk的值, 才能完成get_new_page函数.
 
 wp的变动主要发生在`zftl.c::zns_advance_write_pointer`,下面展示修改前后的结果：
 
@@ -255,17 +302,17 @@ static void zns_advance_write_pointer_bz(struct zns_ssd *zns)
 }
 ```
 
-原本就是先枚举channel然后die，现在先枚举channel以后按道理要在当前子超级块继续枚举，可是无法判断当前子超级块是否满。
+原本就是先枚举channel然后die, 现在先枚举channel以后按道理要在当前子超级块继续枚举, 可是无法判断当前子超级块是否满.
 
-调用这个函数的是`zns_wc_flush`函数，其中原本也不会判定当前zone是否满，就是不断调用该前进函数。
+调用这个函数的是`zns_wc_flush`函数, 其中原本也不会判定当前zone是否满, 就是不断调用该前进函数.
 **所以如何在这个flush函数的某个位置判断当前子超级块是否满**？
 
-逻辑上，用户发出请求时zone一定是没满的，按原本的做法每个blk使用一个页后轮到下一个blk，如果某个blk满了，访问下一个blk，如果全都满了，
-这个zone就是FULL状态，不可能被访问了。所以可以假设flush时zone就是没满的。
+逻辑上, 用户发出请求时zone一定是没满的, 按原本的做法每个blk使用一个页后轮到下一个blk, 如果某个blk满了, 访问下一个blk, 如果全都满了, 
+这个zone就是FULL状态, 不可能被访问了.所以可以假设flush时zone就是没满的.
 
-我为子超级块设定写指针，记录用了多少。单位是什么？每次get_page会取出一个物理页，就让写指针单位是物理页。
-超级块有`ch*lun*plane*blk*num_page`个物理页，子超级块要除以4，当写指针等于这个值时，
-说明当前活跃zone的当前子超级块满了，轮到下一个子超级块(没有就要分配一个)。
+我为子超级块设定写指针, 记录用了多少.单位是什么？每次get_page会取出一个物理页, 就让写指针单位是物理页.
+超级块有`ch*lun*plane*blk*num_page`个物理页, 子超级块要除以4, 当写指针等于这个值时, 
+说明当前活跃zone的当前子超级块满了, 轮到下一个子超级块(没有就要分配一个).
 
 
 
@@ -308,8 +355,8 @@ static void zns_init_params(FemuCtrl *n)
 }
 ```
 
-这里，子超级块的`write_pointer`属性是用来判断是否用满的，
-每次`get_new_page_bz`获取新页就会加1，如果达到`zns->ssblk_size_limit`就认为满了，就分配一个新的子超级块。
+这里, 子超级块的`write_pointer`属性是用来判断是否用满的, 
+每次`get_new_page_bz`获取新页就会加1, 如果达到`zns->ssblk_size_limit`就认为满了, 就分配一个新的子超级块.
 
 zone初始化：
 ```c
@@ -379,7 +426,7 @@ static uint64_t get_subsuperblock(FemuCtrl *n, uint32_t zone_idx){
 }
 ```
 
-方法就是枚举zns的所有子超级块并选择一个未使用的分配。如果都使用了则直接报错。
+方法就是枚举zns的所有子超级块并选择一个未使用的分配.如果都使用了则直接报错.
 
 ##### zone清空
 
@@ -417,7 +464,7 @@ static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
 
 ##### zns.c::zns_nvme_rw
 
-子超级块设计没有改变这里的代码。
+子超级块设计没有改变这里的代码.
 
 ##### zftl.c::zns_wc_flush
 
