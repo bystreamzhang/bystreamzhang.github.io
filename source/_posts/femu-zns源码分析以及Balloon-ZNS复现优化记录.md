@@ -96,9 +96,7 @@ femu模拟的zns代码中, 除了plane以外的blk,fc,ch等层次的结构体也
 
 前面讨论`zns_wc_flush`函数时说明了plane级别的并行性体现. 这里讨论其他层次的并行性.
 
-![](1.drawio.png) 111
-
-![](./femu-zns源码分析以及Balloon-ZNS复现优化记录/1.drawio.png) 222
+(还待补充, 目前还没搞清楚其他层次的并行性体现在代码的哪里)
 
 ## 子超级块相关
 
@@ -215,7 +213,7 @@ static struct ppa get_new_page_bz(struct zns_ssd *zns, FemuCtrl *n)
     NvmeZone *zone = &n->zone_array[zns->active_zone];
     u_int64_t ssblk = zone->ssblk[zone->ssblk_idx];
     struct ppa ppa;
-    femu_debug("[znbc] zftl.c::get_new_page_bz : active_zone=%d zone->ssblk_idx=%ld, zns->ssblk[%ld].write_pointer=%ld zns->ssblk_size_limit=%ld\n",\
+
     zns->active_zone, zone->ssblk_idx, ssblk, zns->ssblk[ssblk].write_pointer, zns->ssblk_size_limit);
 
     if(zns->ssblk[ssblk].write_pointer >= zns->ssblk_size_limit){
@@ -446,7 +444,6 @@ static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
             zns->ssblk[i].used = 0;
             zns->ssblk[i].to_zone = 0;
             zns->ssblk[i].is_ext = 0;
-            femu_debug("[znbc] zns.c::zns_clear_zone : reset ssblk(%d).\n", i);
         }
     }
     zone->num_ssblk = 0;
@@ -462,9 +459,267 @@ static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
 
 #### 核心函数的改动
 
-##### zns.c::zns_nvme_rw
+##### 子超级块对zns_nvme_rw的改动
 
 子超级块设计没有改变这里的代码.
 
-##### zftl.c::zns_wc_flush
+##### 子超级块对zns_wc_flush的改动
+
+此函数本身并没有子超级块,但是其中的子函数`get_new_page_bz`, `zns_advance_write_pointer`在加入子超级块后都有比较大的改动,见上面代码.
+
+## slot相关
+
+### 分析窗口 profiling windows 以及slot大小计算
+
+在`zns.c::zns_nvme_rw`函数中，需要加入分析窗口，压缩过程每次压缩一个分析窗口，然后计算插槽大小，并用于下一个分析窗口的计算。为此还需要维护一个记录CR分布的桶数组。
+
+顺序写的测试发现，设定bs为128k时，一次`zns_nvme_rw`的sg的len是4096，单位是字节，然后nsg是32，乘起来就是128k。如果设定bs=256k，则nsg变成64，设定512k则变成128。这是为了保证`len*nsg`的值等于bs大小。
+
+分析窗口的大小，按论文来设定的话是33554432B。假设bs=256k，则一个分析窗口会包含128次对`zns_nvme_rw`函数的调用(33554432/256k=128)。分析窗口数量不多，并且同一个zone的不同分析窗口可能会有不同的插槽大小，后续都会用到，所以选择在每个zone里都记录这个zone的所有分析窗口结构体，结构体中有窗口插槽大小以及一个记录CR分布的桶数组。
+
+分析窗口结构体我定义如下:
+
+```c
+// added by znbc, profiling window for Balloon-ZNS
+typedef struct ProfilingWindow {
+    uint64_t len; // current length of this profiling window
+    uint64_t percentile_cnt[101]; // counts of different compressed-page-size to page-size percentile
+    uint32_t slot_size_percentile;
+    uint32_t slot_size_bs; // bytes. base is 256B (SLOT_SIZE_BASE in zns.h)
+}ProfilingWindow;
+```
+
+我写了一个`zns_get_pfwd_id_by_slba`函数可以通过slba获取对应的profiling window的id，就不需要在zone内记录当前分析窗口。
+
+```c
+// added by znbc, get profiling window id by start lba
+static inline uint32_t zns_get_pfwd_id_by_slba(NvmeNamespace *ns, uint64_t slba)
+{
+    FemuCtrl *n = ns->ctrl;
+    uint32_t zone_idx = zns_zone_idx(ns, slba);
+    uint64_t zslba = zone_slba(n, zone_idx);
+    return (slba - zslba) / (n->zone_size / ZONE_SIZE_TO_PROFILING_WINDOW_SIZE_RATIO);
+}
+```
+
+**插槽大小计算**。这个应该比较简单，我思路是记录每个百分比的数量，然后最后扫一遍取出我们想要的那个百分比。而且这个插槽大小本身不需要完全精确，分析窗口也不需要刚好被用完，只需要保证每个分析窗口都有一个插槽大小即可，如果当前写入数据量已经超出当前分析窗口，不需要中途切换到下一个（不过其实中途切换也挺简单，编号加1就行，但我想假设整个一次`zns_nvme_rw`写入期间分析窗口编号不变）。
+
+相关代码都体现在zns.c::zns_nvme_rw函数:
+
+```c
+/*Misao: backend read/write without latency emulation*/
+static uint16_t zns_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+                           NvmeRequest *req,bool append)
+{
+    ...
+    // 初始化阶段,获取分析窗口
+    NvmeZone *zone;
+    zone = zns_get_zone_by_slba(ns, slba);
+
+    // added by znbc
+    uint32_t pfwd_id = zns_get_pfwd_id_by_slba(ns, slba);
+
+    ...
+    // 完成写入和压缩后
+    // added by znbc, update the profiling window
+    for(int j = 0; j < nsg; j++){
+        zone->pfwd[pfwd_id].percentile_cnt[req->compressed_size[j] * 100 / len] ++;
+    }
+    zone->pfwd[pfwd_id].len += len * nsg;
+    if(zone->pfwd[pfwd_id].len >= n->zns->profiling_window_size){
+        // calculate the slot size
+        uint64_t cnt = 0, tot = n->zns->profiling_window_size / len;
+
+        for(int k = 0; k <= 100; k++){
+            cnt += zone->pfwd[pfwd_id].percentile_cnt[k];
+            if(cnt * 100 >= tot * CR_VALUE_PERCENTILE){
+
+                if(!k) continue;
+                // update the next profiling window
+                zone->pfwd[pfwd_id + 1].slot_size_percentile = k;
+                
+                zone->pfwd[pfwd_id + 1].slot_size_bs = UPPER((LOGICAL_PAGE_SIZE * k / 100), SLOT_SIZE_BASE); // same as Balloon-ZNS paper
+                if(zone->pfwd[pfwd_id + 1].slot_size_bs > LOGICAL_PAGE_SIZE) zone->pfwd[pfwd_id + 1].slot_size_bs = LOGICAL_PAGE_SIZE;
+
+                break;
+            }
+        }
+    }
+
+    assert(len == LOGICAL_PAGE_SIZE); // So that the nsg is the number of logical pages.(Not necessary. If not, the codes below may need change).
+    uint64_t secs_per_pg = LOGICAL_PAGE_SIZE/n->zns->lbasz;
+    uint64_t start_lpn = slba / secs_per_pg;
+    uint64_t end_lpn = (slba + nlb - 1) / secs_per_pg;
+
+    for (uint64_t lpn = start_lpn, i = 0; lpn <= end_lpn; lpn++, i++){
+        struct slot_bz *slot = &n->zns->slots[lpn];
+        slot->slot_size_bs = zone->pfwd[pfwd_id].slot_size_bs;
+        slot->have_residue = (req->compressed_size[i] > zone->pfwd[pfwd_id].slot_size_bs) ? true :false;
+    }
+    ...
+
+}
+```
+
+省略了一些中间结果输出语句.
+
+### slot大小的使用
+
+知道插槽大小百分比后应该怎么做？
+
+Balloon-ZNS论文:
+
+>为了保持L&Paddr对齐，Balloon-ZNS将连续的闪存页划分为更小的插槽。槽位大小根据数据的可压缩性（参见后续的可压缩性-自适应槽位技术）进行配置。例如，如果插槽大小是页面大小的1/3或2/3，则将一个或两个flash页面分别分区到三个插槽中。每个压缩数据页适合并与一个槽对齐。如果压缩页的内存占用小于插槽，则会浪费插槽中的一些空间。
+>如果内存占用比插槽大，页面将被截断，超过插槽的剩余部分将在日志中单独维护（例如，图3中的数据页C）。
+
+>截断的数据页存储在两个单独的flash页中。通过区域级映射表可以找到包含主导部分的第一个flash页面。假设一个flash页面被分成N个槽位，zone0中的一个逻辑地址为L的截断的数据页可以在映射到Zone 0的主子超级块中的第（L/N）个物理页的第（L%N）个槽中找到。为了定位驻留在额外子超级块中的余量，在写入数据页时，Balloon-ZNS将其物理地址和长度作为管理元数据嵌入到前导部分。因此，可以通过按顺序读取两个闪存页来获得截断的数据页。虽然如果维护独立的页级映射元数据以跟踪残留，则可以并行读取两个闪存页，但由于ZNS ssd对RAM的要求过高，因此不考虑这种方法。
+
+fio(其实就是host端任何应用)都不知道我们有内置压缩，所以对于应用，slb和nlb这些东西都是和没有压缩的时候一样。backend_rw写入的时候也是正常的写入。参考师姐建议, 选择在zftl.c中修改zns_write，因为这个是将逻辑页中的数据下刷到实际的物理页中，并更新逻辑页-物理页的映射表。我们就在这里增加逻辑页-slot的映射。
+
+模拟器中对于请求的处理逻辑如下：
+
+**先调用一次`zns.c::zns_advance_zone_wp`然后调用一次`zftl.c::zns_write`，当写入字节数达到写缓存大小(`1024*4KiB`, 是8192个lba大小)时后者会调用`zftl.c::zns_wc_flush`并轮到一系列的`zftl.c::get_new_page_bz`操作，然后又继续回到`zns_advance_zone_wp`，以此往复**
+
+画图展示就是这样:
+
+![请求处理逻辑图](2.drawio.png)
+
+实际的写入发生在zns.c::zns_nvme_rw，写入的地址就是请求中slba对应的字节地址加上控制器后端逻辑地址mbe。当写入字节数达到写缓存大小时才发生flush并设定映射，flush中是不进行实际的写入或拷贝的。
+
+我的实现思路是用类似于lpn-ppa的映射表去记录lpn和slot的对应关系.
+
+在zns_nvme_rw函数就处理slot的大小并且在zns里记录一个lpn到slot的映射表数组.
+
+做flush的时候，通过lpn获取对应slot进而获取大小，然后每次填充分配的一个空闲物理页.注意, 论文中3.1节提到slot需要和256B对齐,为了简化存储管理.
+
+比如一个设定好pg和spg的ppa是4KB，假设slot百分比是67%，就用67%乘4KB，小数部分向上取整并与256对齐，得到一个字节数，填充该物理页，然后这个物理页剩余的空间直接用于下一个物理页。剩余空间量累积起来就可能超过一个slot大小从而可以直接容纳下一个slot，从而可以节省本应分配的物理页，减少延迟（分析`zns_advance_status`可以得知，同一个plane每次调用该函数都会积累延迟，最终的延迟会取每个plane延迟的最大值，所以减少该函数调用次数就可以减少延迟）。
+
+原有的lpn-ppa映射表的含义需要改变，因为一个ppa可能包含多个slot，不过这个表应该仍然可以存在，同时作为lpn-ppa和slot-ppa的映射表。
+
+**关于读取, 暂时不做考虑.**
+
+我的这种方法和论文的实现方法有所不同,我的可能更简单暴力一点,如果存在问题后续再分析改正.
+
+我的具体代码实现思路：
+
+1. 在zns.c::zns_nvme_rw，先assert(sg.len == LOGICAL_PAGE_SIZE)，对于简单的fio测试是成立的,不成立时再讨论。然后每次就是nsg个逻辑页，即nsg个slot，每个slot需要有一个编号，我希望slot和lpn一一对应，所以当场根据slba求出每个slot的lpn。在zns结构体加一个数组，记录每个slot的residue有几个slot大小（residue具体怎么处理目前不管），这个数组可以类比maptbl，元素个数应该是一样的。另外还要在这里处理slot大小，以宏定义的256B为单位向上取整，记录在分析窗口结构体内。
+2. 在zftl.c::zns_flush里，做的事情就是我上面说的，为了进一步简化代码，我直接在slot里记录当前slot大小。那么写缓存满的时候未必真的写了`1024*4KB`. 核心目标就是减少物理页的获取从而减少延迟。对于跨两个ppa的slot，我让它映射到第一个ppa。
+
+以上只是实现最简单最基本的功能。做完之后理论上应该可以降低写延迟。读取方面后续再考虑。
+
+`zftl.c::zns_flush`的相关代码如下:
+
+```c
+static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t stime, FemuCtrl *n)
+{
+    ...
+    for(j = 0; j < flash_type ;j++)
+            {
+                ppa.g.pg = get_blk(zns,&ppa)->page_wp;
+                get_blk(zns,&ppa)->page_wp++;
+                for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
+                {
+                    if(i >= zns->cache.write_cache[wcidx].used)
+                    {
+                        //No need to write an invalid page
+                        break;
+                    }
+                    ppa.g.spg = subpage;
+                    lpn = zns->cache.write_cache[wcidx].lpns[i]; // this is also a slot-id
+                    bool map_last_ppa = (ppa_res > 0)? true: false;
+                    ppa_res += LOGICAL_PAGE_SIZE;
+                    while(ppa_res >= zns->slots[lpn].slot_size_bs){
+                        ppa_res -= zns->slots[lpn].slot_size_bs;
+                        oldppa = get_maptbl_ent(zns, lpn);
+                        if (mapped_ppa(&oldppa)) {
+                            /* FIXME: Misao: update old page information*/
+                        }
+                        if(map_last_ppa == true){
+                            set_maptbl_ent(zns, lpn, &last_ppa);
+                            map_last_ppa = false;
+                        }
+                        else
+                            set_maptbl_ent(zns, lpn, &ppa);
+                        #ifdef BALLOON_ZNS_RESIDUE
+                        if(zns->slots[lpn].have_residue){
+                            struct nand_cmd swr;
+                            swr.type = type;
+                            swr.cmd = NAND_WRITE;
+                            swr.stime = stime;
+                            /* get latency statistics */
+                            struct ppa ppa_r = get_residue_page(zns);
+                            sublat = zns_advance_status(zns, &ppa_r, &swr);
+                            maxlat = (sublat > maxlat) ? sublat : maxlat;
+                        }
+                        #endif
+                        i++;
+                        if(i >= zns->cache.write_cache[wcidx].used){
+                            //No need to write an invalid page
+                            break;
+                        }
+                        lpn = zns->cache.write_cache[wcidx].lpns[i];
+                    }
+                    last_ppa = ppa;
+                }
+    }
+    ...
+}
+```
+
+## residue
+
+>如果内存占用比插槽大，页面将被截断，超过插槽的剩余部分将在日志中单独维护.我们将分槽的子超级块称为**主子超级块**，将用于记录超大页残余的子超级块称为**额外的子超级块**。主子超级块专门映射到每个区域，而额外的子超级块可以由多个区域共享。一个额外的子超级块被一个开放区域拥有并且只能由它写入，直到它关闭。然后，可以将额外子超级块分配到另一个新开放的区域，来append其残基。通过这样做，每个区域的残数被记录在连续的物理空间中，即连续独立的一组flash页。
+>截断的数据页存储在两个单独的flash页中。通过区域级映射表可以找到包含主导部分的第一个flash页面。假设一个flash页面被分成N个槽位，zone0中的一个逻辑地址为L的截断的数据页可以在映射到Zone 0的主子超级块中的第（L/N）个物理页的第（L%N）个槽中找到。为了定位驻留在额外子超级块中的余量，在写入数据页时，Balloon-ZNS将其物理地址和长度作为管理元数据嵌入到前导部分。因此，可以通过按顺序读取两个闪存页来获得截断的数据页。虽然如果维护独立的页级映射元数据以跟踪残留，则可以并行读取两个闪存页，但由于ZNS ssd对RAM的要求过高，因此不考虑这种方法。
+
+目前还是不做读优化，先只考虑写。
+
+一切从简单出发。我的想法就是：
+
+1. zns有一个ssblk数组，这个数组从末尾往前分配额外子超级块，zns要记录当前可用额外子超级块编号并记得更新。
+2. 每个zone记录其额外子超级块的编号。这些信息足够为residue调用`get_new_page`。考虑到理论上可能一个zone有多个额外子超级块，我也记录总数量和当前id。规定最大数量和ssblk数量一样，这里是4，就是说占的额外子超级块再大也不至于比zone还大吧。
+3. 然后在flush里面，每次取出一个物理页ppa然后处理slot的时候，对于每个有residue的slot，额外创建一个临时的ppa_r，然后根据已有信息调用对应额外子超级块的一个物理页。
+4. 这里需要为此设计一个新函数，可以对比`get_new_page`。如果满了，就从zns的倒数下一个额外子超级块进行取用。
+5. 然后在flush中，使用新取出的物理页更新延迟。至于这个residue的数据是否真的写入这个物理页，我只能说并没有，目前这里只是起到一个模拟计算延迟的效果。
+
+关于论文中说的，“额外子超级块被一个开放区域拥有并且只能由它写入，直到它关闭。然后，可以将额外子超级块分配到另一个新开放的区域。”这种灵活的设计就先不做了，现在就先假设额外子超级块一旦分配就永远属于某个zone。有什么问题以后再改。
+
+这里的一个问题是，`get_new_page`每次取出物理页会赋予ch、lun、blk，而只有ssblk信息的话ch是不知道的，ch是根据zns内部的写指针获得的，每次每次完所有plane后都会更新。exssblk作为ssblk也是有ch级别的并行性的，所以虽然说是连续写入，实际上应该也是可以多个ch轮着写入。不过每次具体使用哪个ch呢？我这里直接也使用zns的写指针了，只是可以一定程度体现ch级别的并行性。不过这样的话同一个ch下可能有一些连续的slot不能体现ch并行性（本来可以体现），但反正这里plane就2个，一个ch对应的物理页也就两个，影响应该不大。
+
+不过这里flush函数中zone的编号不太好获取。所以感觉这个额外子超级块也可以直接与zone无关，就是根据当前zns的额外子超级块编号获取exssblk。这个做法和上面的做法的实际效果应该类似，因为上面也是从后往前分配额外子超级块，实际使用的额外子超级块应该是一样的。如果以后真的要读取residue的实际内容，这部分肯定要改，关键是slot如何得到其residue的位置信息，现在不谈。
+
+相关代码:
+
+获取残留页:
+
+```c
+static struct ppa get_residue_page(struct zns_ssd *zns){
+    struct ppa ppa;
+    struct write_pointer_bz *wpp = &zns->wp_bz;
+    u_int64_t exssblk = zns->now_exssblk;
+    //femu_debug("zftl.c::get_residue_page: exssblk=%lu\n", exssblk);
+    if(zns->ssblk[exssblk].write_pointer >= zns->ssblk_size_limit){
+        if(zns->now_exssblk == 0 || zns->ssblk[ zns->now_exssblk -1].used == true){
+            ftl_debug("[Error] zftl.c::get_residue_page: Do not have more sub-superblocks for residue! Will cause wrong results!\n");
+            if(zns->now_exssblk == 0) zns->now_exssblk = 1;
+        }
+        zns->now_exssblk--;
+    }
+    ppa.ppa = 0;
+    ppa.g.ch = wpp->ch;
+    ppa.g.fc = zns->ssblk[exssblk].lun;
+    ppa.g.blk = zns->ssblk[exssblk].blk;
+    ppa.g.V = 1; //not padding page
+    zns->ssblk[exssblk].write_pointer++;
+    if(!valid_ppa(zns,&ppa))
+    {
+        ftl_err("[Misao] invalid ppa: ch %u lun %u pl %u blk %u pg %u subpg  %u \n",ppa.g.ch,ppa.g.fc,ppa.g.pl,ppa.g.blk,ppa.g.pg,ppa.g.spg);
+        ppa.ppa = UNMAPPED_PPA;
+    }
+    return ppa;
+}
+```
+
+`zns_wc_flush`函数中的额外处理在前面slot部分有展示.
+
+residue总的来说占比不大,对结果的影响也应该不大.不过如果测试数据变复杂, residue导致的空间浪费和垃圾回收开销可能就不容小视了. 
 
