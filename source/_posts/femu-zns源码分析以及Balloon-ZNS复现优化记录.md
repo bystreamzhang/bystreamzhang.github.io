@@ -75,17 +75,17 @@ categories: Study
 假设写缓存有100个, num_plane=2, flash_type=4, 物理页大小是逻辑页大小的4倍也就是说subpage=4, 那么首先, 对于第0个逻辑页, 获取一个新物理页ppa.
 ppa的plane设定为0, 然后ppa的pg变成其blk的page_wp, 然后其page_wp加1,
 然后对于这第0个以及后面的总共4个逻辑页, 取出lpn, ppa记录当前逻辑页的subpage编号, 然后将该逻辑页lpn映射到当前ppa.
-然后逻辑页编号变成4. 4~7号逻辑页同样会使ppa的pg改变并使对应blk的page_wp加1, 从映射结果上看4~7号逻辑页也是映射到与之前相同的物理页ppa.8~11和12~15应该也是.
+然后逻辑页编号变成4. 4-7号逻辑页同样会使ppa的pg改变并使对应blk的page_wp加1, 从映射结果上看4-7号逻辑页也是映射到与之前相同的物理页ppa.8-11和12-15应该也是.
 
-也就是说通过`get_new_page`获取的一个物理页在这种假设下可以容纳`4*4=16`个逻辑页, 其pg和spg属性分别有4种值构成了这16种情况(pg的4个值是ppa的blk本身page_wp往后的4个值,而spg的4个值就是0~3).
+也就是说通过`get_new_page`获取的一个物理页在这种假设下可以容纳`4*4=16`个逻辑页, 其pg和spg属性分别有4种值构成了这16种情况(pg的4个值是ppa的blk本身page_wp往后的4个值,而spg的4个值就是0-3).
 
-在ppa的结构体中(见zns.h),各个属性的域都是规定好的,比如spg就只有2位,表示范围是0~3. 如果物理页大小是逻辑页的16倍,spg就应该有4位.
+在ppa的结构体中(见zns.h),各个属性的域都是规定好的,比如spg就只有2位,表示范围是0-3. 如果物理页大小是逻辑页的16倍,spg就应该有4位.
 
-然后对于i=16~31, 轮到下一个plane的一个新物理页ppa.所有plane做完以后, 使zns的wp前进, 改变channel或lun.然后又回到plane0.
+然后对于i=16-31, 轮到下一个plane的一个新物理页ppa.所有plane做完以后, 使zns的wp前进, 改变channel或lun.然后又回到plane0.
 
-这里的做法应该是为了利用plane的并行性, 这种写法下, 每次都是从plane0开始, 处理完所有plane再进行wp的前进, 获取的物理页ppa的属性只和zns的wp和active zone有关, 
+这里的做法应该是为了利用plane的并行性, 这种写法下, 每次都是从plane0开始, 处理完所有plane再进行wp的前进, 获取的物理页ppa的属性只和zns的wp和active zone有关,
 代码应该是保证了每个plane获取的ppa都属于同一个channel、die并且有一样的blk, 这样不同plane之间就可以并行, 因为同编号的channel, die和blk可以并行.
-这里的并行是模拟的,代码中体现为,每个plane有一个独立的`next_plane_avail_time`,类似计时器,会分别记录延迟,并且取最大值作为要输出的延迟maxlat. 
+这里的并行是模拟的,代码中体现为,每个plane有一个独立的`next_plane_avail_time`,类似计时器,会分别记录延迟,并且取最大值作为要输出的延迟maxlat.
 如果串行则他们的延迟就要累加而非取最值.
 可参考 [SSD基础架构与NAND IO并发问题探讨](https://blog.csdn.net/zhuzongpeng/article/details/134915562)  和
  [论文阅读：SSD内部多级并行性的探索和利用（TOC 2013）](http://cighao.com/2016/07/20/paper-reading-02-the-multilevel-parallelism-inside-SSDs/) 
