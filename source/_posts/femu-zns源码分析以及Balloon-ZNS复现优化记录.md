@@ -614,53 +614,53 @@ static uint64_t zns_wc_flush(struct zns_ssd* zns, int wcidx, int type,uint64_t s
 {
     ...
     for(j = 0; j < flash_type ;j++)
+    {
+        ppa.g.pg = get_blk(zns,&ppa)->page_wp;
+        get_blk(zns,&ppa)->page_wp++;
+        for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
+        {
+            if(i >= zns->cache.write_cache[wcidx].used)
             {
-                ppa.g.pg = get_blk(zns,&ppa)->page_wp;
-                get_blk(zns,&ppa)->page_wp++;
-                for(subpage = 0;subpage < ZNS_PAGE_SIZE/LOGICAL_PAGE_SIZE;subpage++)
-                {
-                    if(i >= zns->cache.write_cache[wcidx].used)
-                    {
-                        //No need to write an invalid page
-                        break;
-                    }
-                    ppa.g.spg = subpage;
-                    lpn = zns->cache.write_cache[wcidx].lpns[i]; // this is also a slot-id
-                    bool map_last_ppa = (ppa_res > 0)? true: false;
-                    ppa_res += LOGICAL_PAGE_SIZE;
-                    while(ppa_res >= zns->slots[lpn].slot_size_bs){
-                        ppa_res -= zns->slots[lpn].slot_size_bs;
-                        oldppa = get_maptbl_ent(zns, lpn);
-                        if (mapped_ppa(&oldppa)) {
-                            /* FIXME: Misao: update old page information*/
-                        }
-                        if(map_last_ppa == true){
-                            set_maptbl_ent(zns, lpn, &last_ppa);
-                            map_last_ppa = false;
-                        }
-                        else
-                            set_maptbl_ent(zns, lpn, &ppa);
-                        #ifdef BALLOON_ZNS_RESIDUE
-                        if(zns->slots[lpn].have_residue){
-                            struct nand_cmd swr;
-                            swr.type = type;
-                            swr.cmd = NAND_WRITE;
-                            swr.stime = stime;
-                            /* get latency statistics */
-                            struct ppa ppa_r = get_residue_page(zns);
-                            sublat = zns_advance_status(zns, &ppa_r, &swr);
-                            maxlat = (sublat > maxlat) ? sublat : maxlat;
-                        }
-                        #endif
-                        i++;
-                        if(i >= zns->cache.write_cache[wcidx].used){
-                            //No need to write an invalid page
-                            break;
-                        }
-                        lpn = zns->cache.write_cache[wcidx].lpns[i];
-                    }
-                    last_ppa = ppa;
+                //No need to write an invalid page
+                break;
+            }
+            ppa.g.spg = subpage;
+            lpn = zns->cache.write_cache[wcidx].lpns[i]; // this is also a slot-id
+            bool map_last_ppa = (ppa_res > 0)? true: false;
+            ppa_res += LOGICAL_PAGE_SIZE;
+            while(ppa_res >= zns->slots[lpn].slot_size_bs){
+                ppa_res -= zns->slots[lpn].slot_size_bs;
+                oldppa = get_maptbl_ent(zns, lpn);
+                if (mapped_ppa(&oldppa)) {
+                    /* FIXME: Misao: update old page information*/
                 }
+                if(map_last_ppa == true){
+                    set_maptbl_ent(zns, lpn, &last_ppa);
+                    map_last_ppa = false;
+                }
+                else
+                    set_maptbl_ent(zns, lpn, &ppa);
+                #ifdef BALLOON_ZNS_RESIDUE
+                if(zns->slots[lpn].have_residue){
+                    struct nand_cmd swr;
+                    swr.type = type;
+                    swr.cmd = NAND_WRITE;
+                    swr.stime = stime;
+                    /* get latency statistics */
+                    struct ppa ppa_r = get_residue_page(zns);
+                    sublat = zns_advance_status(zns, &ppa_r, &swr);
+                    maxlat = (sublat > maxlat) ? sublat : maxlat;
+                }
+                #endif
+                i++;
+                if(i >= zns->cache.write_cache[wcidx].used){
+                    //No need to write an invalid page
+                    break;
+                }
+                lpn = zns->cache.write_cache[wcidx].lpns[i];
+            }
+            last_ppa = ppa;
+        }
     }
     ...
 }
