@@ -68,6 +68,20 @@ requestdistribution=zipfian
 
 对于同一个负载,如果两次运行,分别带有-load和-run参数,他们执行的程序是不同的,程序内的一些变量值会初始化.不过load会往设备写入数据, 我这里配置后应该会往模拟的zns ssd设备nvme0n1写入数据, 然后run阶段会读取这些数据并执行操作.
 
+对于基本的6个workload, 设定的每个插入数据大小为:`Default data size: 1 KB records (10 fields, 100 bytes each, plus key)`
+
+实际打印可以发现,key是`userxxx`形式,其中xxx部分就是20个数字(也存在19的情况,不知道为什么),合起来key长度是24, 加上10个100bytes的fields就是1KB.
+
+再具体打印fields或者分析将values转为data的`SerializeRow`函数,可以发现每个fields还有一个string类型的name属性, 内容就是`"fieldsX"`, X从0-9.
+
+每个fields的name和其size会被放入data, 而key不会. 并且name和size的长度会以4字节放入data, 结构如下图:
+
+![insert_input and converted data structure](data.drawio.png)
+
+所以data的实际长度不是1024, 而是1000 + 10*6 + 10*4*2 = 1140.
+
+这里的分析意义在于自行设计数据生成程序并"欺骗"YCSB, 使其能正常改用我们指定的数据进行测试而非默认的随机数据.
+
 ## 原生femu测试
 
 我打算先学会用ycsb测原生femu，balloon-zns的测试可能会有额外问题。
@@ -183,11 +197,19 @@ rocksdb的测试脚本是有 `--compression_type=none`的。根据rocksdb_db.cc�
 
 对于run阶段存在insert的情况,我暂时不考虑改动,就插入默认生成的数据吧.
 
-### 错误记录
+结合前面基本知识处的分析, 我不能简单取消原先的insert函数, 我生成的数据必须是完全符合insert函数内部接受的数据格式的, 更底层的东西我不想改变.
 
-1. 对于`requestdistribution=zipfian`的几个workload,run阶段的READ都变成READ-FAILED, UPDATE都变成UPDATE-FAILED, 测试结果自然也比较奇怪, 同workload不同测试数据差距可能很大,但是对于没有内置压缩的原生femu不应该这样.
+至于key, 本来我生成数据时key是从0开始递增, 但分析rocksdb_db.cc代码后, 我认为insert的key和后续run阶段使用的key是对应的, 所以我们必须使用insert函数本来会使用的key.
 
-原因分析和解决:
+每次insert的key都是独一无二的, 所以load阶段我不需要考虑insert接受的key重复的问题. 我可以直接按顺序来, 第一个接受的key在我这里对应1, 然后取出指定数据中的第一个1000B作为value.
+而对于run阶段的insert, 输入的key基本也都是独一无二的, 可能存在某个insert后的key被delete然后又insert的情况, 但应该比较少.
+总的来说, 我的想法是, load和run阶段分别有一个insert计数器, 每次insert时根据计数器取出输入数据对应位置的1000B数据, 其他就还是和原insert函数做法一致. 所以key我是不动的, 只是替换value.
 
+这样的一个好处是, 事实上我根本不需要做数据转换了, 原生的文本文件就够用, 每次取1000B就行了. 不过如果完全用原生数据, 程序内部要每次取10次100B来构成data, 这个额外时间可能影响测试结果, 所以这个转换成1140B的步骤就直接在外部的`convert_to_ycsb.py`做了, 也不会很复杂, 按data结构生成就行.
 
+这个预处理最麻烦的是data结构中两个length部分, 因为是实际占了4个字节, 源码中用了一种奇怪的方式, 本质上就是把数字对应的4个字节存到字符数组里并且顺序是小端序, 低字节在前. 比如长度是100的时候, 是 64 00 00 00, 如果单字节打印, 很可能后面3个字节是显示不了的异常字节(并且打印字符串时遇到它们会直接视为打印结束,类似换行符), 第一个字节对应的字符是d所以会显示一个d.
+
+python中要实现这个效果, 也需要一些额外操作, 具体见代码.
+
+我的这个数据生成和使用的总思路存在几个可能问题:1. 输入文件大小如果不够怎么办? 那就取模.如果大小过大, 超出部分就用不到. 2. run阶段的insert也会重头开始取输入数据, 这可能和实际测试存在差异, 本来这个insert结果不应该和load阶段的insert相同. 不过这种相同应该对测试效果无影响, 毕竟数据本身就是我们决定的, 插入什么也是我们定的. 这个问题其实也可以改正不过先就这样. 3. 我预处理出data, 相对来说可能还使insert时需要的时间变短了, 不过也有额外读取文件的耗时, 感觉影响应该不大.
 
