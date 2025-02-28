@@ -73,8 +73,8 @@ cover:
 dream:
   enable: true
   showTitle: true
-  title: 价值与意义
-  text: 不要沦为价值论的奴仆，但总还是需要寻求和维系只属于自己的意义。
+  title: 我的价值观
+  text: 任何事情都可以既有价值也无价值, 不认可某人, 不被认可, 什么都不认可, 这些想法都可以理解. 在我看来, 关键是要去寻求和维系只属于自己的意义。
 
 
 # Whether to display the musics.
@@ -218,7 +218,7 @@ mathjax:
 # 文章信息--若要开启文章字数统计，需要安装 hexo-wordcount 插件，安装命令: `npm i --save hexo-wordcount`
 postInfo:
   date: true # 发布日期
-  update: false # 更新日期
+  update: true # 更新日期
   wordCount: true # 文章字数统计
   totalCount: true # 站点总文章字数
   min2read: true # 文章阅读时长
