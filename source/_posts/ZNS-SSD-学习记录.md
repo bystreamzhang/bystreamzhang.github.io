@@ -4,13 +4,29 @@ date: 2025-02-27 22:55:46
 tags:
     - ZNS
     - SSD
+categories: Study
 ---
 
 # 说明
 
-参考ZNS SSD核心论文: [ZNS: Avoiding the Block Interface Tax for Flash-based SSDs](https://www.usenix.org/conference/atc21/presentation/bjorling) 
-
 记录一些基本知识和学习心得. 目前可能比较零散化, 不一定有前后完整的逻辑, 觉得有必要的时候会进行系统整理, 届时逻辑会完整, 不会突然出现新概念
+
+## 论文
+
+ZNS SSD核心论文: [ZNS: Avoiding the Block Interface Tax for Flash-based SSDs](https://www.usenix.org/conference/atc21/presentation/bjorling) 
+
+并行性相关:
+
+- [What you cant forget: Exploiting parallelism for zoned namespaces](https://yonsei.elsevierpure.com/en/publications/what-you-cant-forget-exploiting-parallelism-for-zoned-namespaces#:~:text=This%20paper%20discusses%20the%20main%20benefits%20of%20ZNS,internal%20parallelism%20when%20downsizing%20its%20zone%20writable%20capacity.)
+- [Accelerating RocksDB for small-zone ZNS SSDs by parallel I/O mechanism](https://dl.acm.org/doi/abs/10.1145/3564695.3564774#:~:text=In%20this%20paper%2C%20we%20propose%20two%20parallel%20I%2FO,distributing%20I%2FO%20data%20to%20multiple%20zones%20in%20parallel.)
+
+FlexZNS:
+
+- [FlexZNS: Building High-Performance ZNS SSDs with Size-Flexible and Parity-Protected Zones](https://ieeexplore.ieee.org/document/10361036)
+
+这些论文的背景部分都很值得看, 可以帮助了解和巩固基础知识.
+
+
 
 ## zone
 
@@ -61,3 +77,146 @@ zone不支持随机写入, 那么如果要更新zone的某部分数据应该怎�
 
 当然有更好的方案. 一种简单的想法就是, 顺序写入新内容, 更新L&P映射表(将要更新的逻辑块(LBA)的映射改变到新内容的物理地址),
 旧数据所在的物理块标记为无效, 后续通过zone reset回收. 这样就无需擦除整个zone.
+
+### 超级块
+
+超级块是ZNS SSD引入的设计.
+
+在FlexZNS论文的引言里用了FBG(flash block group)的说法, 更好理解, 就是一群闪存块的组.
+本质上和超级块是一个东西, 不过FlexZNS论文里偏向于用FBG表示一个组的概念而超级块是一个整体, 称zone映射到超级块.
+
+FBG是空间分配和垃圾回收的基本单元.
+
+为了利用并行性和增强可靠性，每个FBG包含跨许多die的具有相同偏移的闪存块(就可以并行)，并构成具有奇偶校验保护的die级RAID条带.
+(RAID条带（strip）是把连续的数据分割成相同大小的数据块，把每段数据分别写入到阵列中的不同磁盘上的方法)
+
+目前的ZNS SSD产品通常将一个区域映射到这样的FBG上，因此区域大小达到GB大小，例如西部数据ZN540 SSD为2GB，浪潮NS8600 SSD为1.44GB，
+FTL只需要维护一个区域级映射表，其大小为每1TB存储容量几个KB.
+
+从主机端的角度来看，ZNS接口将GC责任从SSD FTL转移到主机软件。
+
+zone是空闲空间分配和GC的基本单位。这和超级块FBG是一样的. 对于ZNS SSD, 就可以认为zone和FBG是一一对应的, 只是后者偏向物理层面, 前者是逻辑层面.
+
+主机软件能够控制zone上的数据放置，其中可以利用丰富的主机端语义来减少区域GC开销，
+最近的研究表明，这种软件可定义的能力可以显著提高存储性能和WA/RocksDB（一种流行的键值存储）应用场景中的生命周期
+
+
+
+### 并行性
+
+
+
+## FlexZNS
+
+FlexZNS主要是指出较大的区域的一些缺点, 以及小区域的一些优点, 然后主张应扩展当前NVMe ZNS协议支持大小可配置区域.
+
+论文代码github: [FlexZNS-ICCD23-EA](https://github.com/ywang-wnlo/FlexZNS-ICCD23-EA)
+
+补充一句, 这个仓库用的是子模块加patch, 直接clone下来子模块文件夹是没内容的, 需要`git submodule update --init --force FEMU/base`,
+然后将补丁移动到base文件夹并用`git apply FlexZNS.patch`打补丁才能看到实际代码以及历史提交记录.
+FlexZNS不仅修改了FEMU的代码, 还修改了内核代码以及zenfs, rocksdb, f2fs这些测试用工具环境的代码, 来实现其功能. 都是子模块加补丁的形式.
+如果我没理解错, zenfs, rocksdb, f2fs这些测试用工具环境都是需要在虚拟机(如qemu)上配置运行, 只是都统一放到一个github仓库里了.
+
+### 问题背景
+
+大区域在哪些地方不如小区域?
+
+ZNS SSD并没有消除垃圾回收, 而是把责任从FTL转移给主机软件.
+
+在论文环境中, 当空闲存储空间耗尽时, F2FS或ZenFS将触发区域GC操作. 迁移将牺牲的区域中的有效数据页面, 然后将区域重置为空闲
+
+为了减少GC开销，通常将具有不同生命周期（或写热度）的数据存储在不同的GC单元中。
+然而，较大的区域大小会妨碍准确的数据分离，并导致区域GC期间大量的有效数据迁移。
+
+此外, 较大的区域需要更多硬件资源, 则可以同时打开的区域数量(OPEN_ZONE_LIMIT)会更少, 这会减少写并发性和多租户共享能力.
+
+其次, 在多租户场景中, 使用小区域有助于租户之间的性能隔离.
+由于小区域映射到的FBG会跨越更少的闪存die, 不同租户的区域就能被放置到单独的闪存die中来实现硬件隔离.
+
+如果能支持大小可配置区域, 能提供更好的软件可定义能力, 可以扩大应用场景.
+例如, 应用程序可以选择小区域来存储一小组写热数据以减少GC开销, 而大区域可以用于写冷数据;
+在一些常见的场景中, 多个应用程序共享同一个ZNS SSD, 它们可以根据他们自己的数据访问模式为各自的区域配置不同的大小.
+
+但这样做是有挑战的, 大概有如下方面:
+
+- zone越多, RAID保护(比如奇偶校验存储)实现起来开销可能越大或者说实现形式会需要改变
+- 如果允许应用程序配置可变区域大小, 应用程序自己管理存储空间也会变得困难, 因为每个zone的用户可写容量会随区域大小配置而改变, 如下面表格所示
+
+| RAID Stripe | Zone size | Zone capacity | Utilization |
+| ----------- | --------- | ------------- | ----------- |
+| 63+1p       | 2048 MB   | 2016 MB       | 98.44%      |
+| 31+1p       | 1024 MB   | 992 MB        | 96.88%      |
+| 15+1p       | 512 MB    | 480 MB        | 93.75%      |
+| 7+1p        | 256 MB    | 224 MB        | 87.50%      |
+| 3+1p        | 128 MB    | 96 MB         | 75%         |
+
+也可以看下图:
+
+![Mapping of zones in different size configurations.](zones_in_diff_sizes.drawio.png)
+
+如果把zone空间设置太小, 也未必有利于减少GC开销, 虽然GC时数据迁移开销会减少, 但GC频率可能增加, 每次GC释放的空闲空间量会减少.
+
+关于不同zone大小下的性能, GC在写放大中的占比, FlexZNS论文有做测试.
+结果显示, 除了不存在GC的seq-read等数据集是zone越大越快, 大部分数据集下, zone大小是过大过小都会使性能变慢
+GC也确实是写放大的主要贡献者, zone过小或者过大时GC开销都会增加
+
+### 解决方案
+
+FlexZNS的核心思路是, 要保证用户体验, 用户在设置可变区域大小后自己不需要额外做管理.
+看到zone多大就是多大, 不会因为设置而改变. 即要隐藏zone容量损失, 或者说用户不需要知道容量损失.
+
+具体来说, 把区域内的奇偶检验存储分离出去. 将闪存存储分为数据区(data area)和奇偶校验区(parity area).
+
+将zone映射到的块的数量缩减, 称每个zone映射到的块的集合为超级块(也称为该zone的FBG), 这些超级块位于data area.
+根据FlexZNS论文的一些描述, 该论文中每个超级块是不可再分的, 就是包含所有die的一个同编号的块, 不过zone和FBG是可以小于超级块的.
+
+每个zone的奇偶校验数据存储在专门的奇偶校验超级块(parity superblocks)中, 位于一个没有和zone的FBG重叠的die.
+
+大的zone可以和小zone并存, 达成一种平衡.
+
+FlexZNS的结构图如下:
+
+![Design overview of FlexZNS](FlexZNS.png)
+
+为了保证可靠性，每个zone被映射到一个跨越多个die的闪存块组（FBG），并由die级RAID奇偶校验保护.
+
+#### zone 容量管理
+
+下面用W表示FlexZNS做的工作, E表示解释, S表示样例.
+
+W: FlexZNS为主机软件提供了一个API，用于通过自定义的NVMe命令（命名为zone format）配置分区大小（zone size list，zone num list）
+
+W: 基于区域大小配置，FlexZNS计算容纳区域的总奇偶校验所需的闪存存储量
+
+E: 奇偶检验存储量的计算方式, 公式我就不记录了, 知道以下几点就好:
+
+- 每个奇偶检验块的大小是一样的;
+- 每个zone都有一个奇偶校验块, 且如果大小等于超级块, 则有两个奇偶校验块
+
+W: 如果计算后发现用户配置会导致数据区和奇偶校验区的总大小超过闪存的物理容量, 则报错并要求用户干预.
+
+S: 
+用论文的例子. 假设具有1TB物理容量的SSD被格式化为大小为512MB和2GB的两组区域。每组分别具有64和480个区域. 奇偶校验块大小为32MB.
+则数据区(data area)大小为512MB × 64+2GB × 480 = 992GB，奇偶校验区(parity area)大小可以直接计算, 为32MB（480+64+480）= 32GB。
+
+E: 减少奇偶检验的一种简单方法是构建RAID条带, 在一个超级块内跨越多个zone, 这样奇偶校验可以被这些zone共享.
+不过这样一旦条带上的zone被重置并且写入新数据, 闪存上的奇偶校验块就必须被更新, 会导致更高的性能和WA开销.
+所以FlexZNS不采用这种方法, 他们认为当配置小区域时, 奇偶校验存储开销可以得到补偿, 并且总存储成本可以降低.
+
+#### zone映射
+
+W: FlexZNS提出一种新的zone映射机制去分别管理数据和奇偶校验.
+
+如FlexZNS的结构图所示, zone映射到数据区域中的FBG, 而其奇偶校验块位于奇偶校验区.
+
+FlexZNS的FTL维护zone和FBG及其奇偶校验块之间的映射表. 这个表平时放在DRAM里, 会被周期性地存入闪存, 在关机等特殊情况也会写入闪存 (DRAM是易失性存储, 闪存是非易失).
+
+S: 对于1TB的SSD, 如果全部分别由512MB或1GB或2GB大小的zone组成, 则表大小为32KB, 16KB, 或12KB(假设超级块大小为2GB, 因此2GB的zone需要两个奇偶校验块).
+
+W:
+数据映射: FlexZNS将zone映射到闪存上的一个FBG, 其由跨越多个die的闪存block组成, 也就是一个超级块的一部分.
+FlexZNS在data area分配一定数量的超级块来容纳区域, 并将每个超级块拆分为多个适合zone大小的FBG.
+当一个zone被打开用于写入时, 具有相同大小的空闲FBG被分配和引用.
+FlexZNS当前实现的分配策略是为每组相同大小的区域维护一个空闲FBG列表, 并优先选择位于包含开放区域/FBGs最少的die上的FBG来分配.
+
+奇偶校验映射: 
