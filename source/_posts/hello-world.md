@@ -1,7 +1,7 @@
 ---
 title: Hello World
 hide: true
-password: "1234567890"
+password: c775e7b757ede630cd0aa1113bd102661ab38829ca52a6422ab782862f268646
 ---
 Welcome to [Hexo](https://hexo.io/)! This is your very first post. Check [documentation](https://hexo.io/docs/) for more info. If you get any problems when using Hexo, you can find the answer in [troubleshooting](https://hexo.io/docs/troubleshooting.html) or you can ask me on [GitHub](https://github.com/hexojs/hexo/issues).
 
