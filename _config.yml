@@ -132,3 +132,12 @@ feed:
   content_limit: 140
   content_limit_delim: ' '
   order_by: -date
+
+# Server
+server:
+  port: 4000
+  log: false
+  compress: false
+  header: true
+  serve_static: true
+  watch: true  # 监视文件变动

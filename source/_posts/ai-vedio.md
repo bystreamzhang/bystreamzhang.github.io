@@ -1,6 +1,7 @@
 ---
 title: ai-vedio
 date: 2025-02-28 20:23:30
+hide: true
 tags:
     - AI
     - vedio

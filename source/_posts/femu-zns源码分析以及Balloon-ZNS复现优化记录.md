@@ -13,6 +13,15 @@ categories: Study
 
 本文为做毕设项目时的笔记.
 
+毕设项目概括:
+
+Balloon-ZNS论文要在ZNS SSD中加入内置压缩, 使用有FEMU模拟的ZNS SSD硬件的QEMU虚拟机, 代码主体是FEMU, 其中包含对zns ssd的软硬件模拟代码.
+使用fio, rocksdb, YCSB, zenfs等工具环境进行测试.
+Balloon-ZNS虽然加入了内置压缩, 但实际存在一些问题, 比如其提出的方法会显著降低压缩效果, 影响性能.
+内置压缩会破环逻辑页和物理页的对齐, 大小不同的压缩数据段很能存储, Balloon-ZNS提出的Slot层次会存在要处理溢出残量的问题,
+Balloon-ZNS对残量的处理也存在许多优化空间.
+我的目标是复现并测试Balloon-ZNS, 分析其中存在的问题, 然后提出一些优化方案并进行实现和测试.
+
 [FEMU官方文档](https://github.com/MoatLab/FEMU)
 主体代码在hw/femu.
 代码分析可参考[0 FEMU 简介 | ["FEMU闪存仿真平台介绍及使用文档"]](https://nnss-hascode.github.io/FEMU-Doc/FEMU-Doc.html)
@@ -39,6 +48,7 @@ categories: Study
 > 关于lb: 逻辑块是比逻辑页还小的单位, 一个lb为512B.lb是`zone->w_ptr`、`zone->d.wp`、`n->zone_size`等变量的单位.
 >
 > lba不是以字节为单位, 而是以lb为单位.slba=524288代表第524288个lb.可以通过函数转为具体字节地址.
+> lba是相对整个zone空间的而不是某个zone. 所以0号zone的slba是0, 1号zone的slba可能是524288(假设一个zone有524288个lba).
 
 2. 根据slba获得对应zone指针(使用`zns_get_zone_by_slba`函数).
 3. 通过`zns_check_zone_write`等函数初步检查这个请求是否合法, 比如zone是否装得下nlb个lb.
@@ -89,9 +99,47 @@ ppa的plane设定为0, 然后ppa的pg变成其blk的page_wp, 然后其page_wp加
 这里的并行是模拟的,代码中体现为,每个plane有一个独立的`next_plane_avail_time`,类似计时器,会分别记录延迟,并且取最大值作为要输出的延迟maxlat.
 如果串行则他们的延迟就要累加而非取最值.
 可参考 [SSD基础架构与NAND IO并发问题探讨](https://blog.csdn.net/zhuzongpeng/article/details/134915562)  和
- [论文阅读：SSD内部多级并行性的探索和利用（TOC 2013）](http://cighao.com/2016/07/20/paper-reading-02-the-multilevel-parallelism-inside-SSDs/) 
+ [论文阅读：SSD内部多级并行性的探索和利用（TOC 2013）](http://cighao.com/2016/07/20/paper-reading-02-the-multilevel-parallelism-inside-SSDs/)
 
-femu模拟的zns代码中, 除了plane以外的blk,fc,ch等层次的结构体也都有一个计时器,但是只有plane的计时器被使用了,所以其他层次的并行性体现在哪里?
+femu模拟的zns代码中, 除了plane以外的blk,fc,ch等层次的结构体也都有一个计时器,但是只有plane的计时器被使用了,所以其他层次的并行性体现在哪里? 后面分析.
+
+## 延迟模拟
+
+简单说一下延迟模拟, 不做详细解释 (自己也还没弄清全貌).
+
+FEMU通过延迟模拟来模拟真实SSD的性能, 代码中会对操作计算延迟并传递给用户, 或者说测试工具.
+
+比如, 在`zftl.c::zns_write`中, 最后会返回一个计算后的延迟maxlat来反映这次写入的延迟, 如果我们自行给它加上一个大数, 其他都不变,
+使用fio, YCSB等测试工具测试时也可以看到测试时间会明显延长, 说明这个延迟不仅仅是数值, 也会实际影响运行时间, 大概就是模拟器会强制停顿这段时间来影响模拟硬件的性能表现.
+
+每个plane都有一个延迟计时器, 但并不是直接根据其总延迟来获得每次读写的延迟值. 下面具体说明延迟计算.
+
+### 延迟计算说明
+
+每一次延迟计算是针对一次req进行的, 目标是计算一个lat并执行`req->reqlat = lat;` 和 `req->expire_time += lat;`. 暂不考虑后续如何使用这个值, 但假设lat会影响最终模拟的性能.
+
+一次req包含的基本信息就是slba和nlb, 说明从slba开始读或写nlb个lb. 以及stime, 表示请求开始时间. 延迟是相对这个时间的.
+
+一次req的lat计算发生的背景函数是`zftl.c::zns_write`, 简单说就是处理slba和nlb对应的所有lpn.
+如果是读取则直接映射到ppa然后通过计算lat的核心函数`zns_advance_status`计算lat, 如果是写则放入写缓存, 当写缓存满时调用`zns_flush`.
+`zns_flush`中, 分配ppa来处理每一个lpn, 并对每个ppa调用`zns_advance_status`计算lat.
+
+一次req的lat计算过程中, stime是不变的, 而每个plane的计时器会变. 如果小于stime则会先同步到stime再增加. lat是取他们的差值.
+
+不管是对于读或写, `zns_advance_status`计算的lat仅是sublat, 会取最值得到maxlat来返回. 也就是说, 每个req中的所有lpn对应的ppa, 只取计算出的lat的最大值.
+
+也就是说对于一次请求req, 所有空闲plane(计时器小于stime)都是从stime这同一起跑线开始计算延迟, 最终使用的lat是所有plane计算的延迟的最大值.
+
+而req的大小取决于slba和nlb. 如果req很小, 涉及的ppa也会很少, 那么即使分配的plane很少也可能足够使得他们的延迟最值很小.
+换句话说, 这种情况下即使分配plane特别多, 也未必能有什么优化效果.
+
+S: 假设一个写req总共涉及16个ppa, 刚好有16个plane可以并行处理, 然后刚好均摊分配这些plane, 此时每个ppa调用的`zns_advance_status`计算的lat就是一次写入默认的写延迟(如12196000).
+然后如果改成有64个plane, 多余的plane并不能减少延迟, 最终的lat不会变化.
+
+所以plane数量增多带来的并行性提升未必能提升模拟的性能效果, 非常依赖于:
+
+1. 每次req涉及的ppa数量
+2. 涉及的ppa的plane的分布(是集中于某些plane还是均摊分布)
 
 ## 并行性
 
@@ -136,6 +184,12 @@ static inline struct zns_plane *get_plane(struct zns_ssd *zns, struct ppa *ppa)
 执行多Plane操作时有一些限制. 例如, 进行多Plane读/写操作的Page必须位于具有相同芯片、芯片Die、Block和Page地址的Plane上（仅Plane不同）
 
 所以不需要考虑block层次的并行性, 是不存在的.
+
+## 硬件设置
+
+femu模拟器的硬件设置方式是, 在编译生成得到的运行脚本中(或者在`femu-scripts`中)修改诸如`SSD_SIZE_MB`等变量, 将作为参数传递.
+
+不过, 在代码内部也要匹配外部设置. 比如物理页ppa的各级位表示, 在代码中默认是给channel 2位, 这会导致代码内认定的物理页所在channel最多就是2种编号, 理论上会影响结果. 可以看我下面Balloon-ZNS复现中的一些记录.
 
 ## Balloon-ZNS思想
 
@@ -335,7 +389,7 @@ Balloon-ZNS论文说, 他们的这种压缩能力除了可以被主机以透明�
 此外，如果数据流的压缩性较差或读取关键，主机可以显式禁用某个区域的压缩（例如，通过提示的区域打开命令），并将该区域映射到闪存超级块。
 不过这些都是后话. 关键是Balloon-ZNS本身要有一个好的效果.
 
-## 子超级块相关实现
+## 初步的层级分析以及子超级块相关实现
 
 子超级块是超级块的划分. 具体如何划分?
 
@@ -351,11 +405,56 @@ zone的大小默认和超级块相同, 也是2GB. 子超级块大小被设置为
 默认是8个ch, 每个ch有4个die, 每个die有2个plane, 每个die有32个block. 这里应该是脚本本身说错了, 32是每个plane的blk数量.
 
 写指针会按这个设定前进.
-不过FEMU的ZNS SSD中, ppa的结构体设置里, 只分配给channel 1个bit, 就是只支持0和1号ch. **这样合理吗?**
+不过FEMU的ZNS SSD中, ppa的结构体设置里, 只分配给channel 1个bit, 就是只支持0和1号ch.
+这样不太合理, 相当于就是2个ch.
+我试着完全按Balloon-ZNS论文去配置内外的参数.
+
+论文里面SSD有256GB, 非常大, 而femu默认的ZNS SSD设置才4GB. 我觉得页大小和块数量不用一致, 因为不影响并行性.
+其他方面我想改成和论文一致. 不过仔细分析发现, 论文没有提到plane, 而由于每个超级块有64个块, 总共也就64个die, 所以论文里可以认为plane就1个.
+FEMU默认配置是die4个pl2个, 论文是die8个pl1个, 那么其实是匹配的. 所以也就不用改.
+
+不过后面做rocksdb测试时, 由于zone数量需要32个, 我改了`SSD_SIZE_MB`为8192MB并将代码内的`num_pages`锁死为256, 这样可以使zone数量固定为32.
+代码中, ppa结构体我也改成符合外部设置的数量. 具体就是改zns.h的宏定义, 诸如`CH_BITS`等.
+
+> 这里, zwl师姐说, 她试过把ch_bits设置为3，再次测试发现写性能显著提高，然而读性能会不知原因地下降至与写性能一致。另外一个奇怪的点是，在ch_bits=3时，内置压缩后写性能似乎也并不会再提升了。她在femu的仓库里提了issue，作者承认是代码有bug，但他们不知道bug在哪。
+
+我自己在修改后测试原生femu的结果是, fio的顺序写测试速度暴增, 大概就是4倍, 符合预期,而YCSB的所有负载和数据集测试都没什么变化.
+我不禁怀疑femu代码的并行性实现是在fio测试下才可以体现, 或者至少这个CH_BITS对并行性的影响是这样, 而YCSB的测试就不太能体现.
+Q: 为什么呢?
+
+A: 我对CH_BITS=3和1的情况分别做YCSB测试, 额外统计每个pl全程的总延迟.
+测试时使用了六个负载和Balloon-ZNS的数据集, 结果发现对于同一个plane, 比如`ch=0 fc=0 pl=0`对应的plane, ch2个时的总延迟和写延迟大概就是ch8个时的4倍, 读延迟大概是2倍.
+不过偶然发现这个新增加的plane延迟计时器在多次测试中不会初始化, 我怀疑之前没做好测试间的初始化, 之后会弄清楚, 这里不提(**TODO**).
+
+主要是, 现在确定了YCSB的延迟计算是会受到CH_BITS影响的, 但不知道为什么对最终的测试结果没什么影响.
+我怀疑, 用来模拟的延迟并不是按我之前的理解--即, 并不是完全看plane的总延迟, 并不是plane数量翻倍性能就翻倍.
+代码中真正传递的延迟是`lat`(可能是读或写延迟), 其并不反映历史总延迟. 一次写入的默认延迟是12196000, ch8时lat最大就是12196000, 不过ch2时存在lat为24392000甚至更大的情况,
+此时应该才真正影响性能, 不过这种情况并不算多, 数万次lat计算中只有972项, 而lat为36588000的有876项, 为48784000的有752项, 为60980000的情况就没有了. 所以总影响就很小.
+而对于效果显著的FIO测试, ch2的情况下, 12196000总共6124项, 而36588000可以有5024项, 48784000可以有6547项; 换到ch8情况, 12196000项数就大于2万了, 说明此时优化效果确实明显.
+
+Q: 但是为什么实际传递的lat往往很小呢? 中间存在某种刷新重置的机制吗? plane数量对于延迟计算的影响依赖于什么因素? 这部分的分析我放到前面关于延迟模拟的部分了.
+
+### 子超级块设计思路
 
 回到子超级块设计.
 
-子超级块0必然不能包含所有block0.
+子超级块是超级块的下一级, 核心目的是用来区分出主子超级块和额外子超级块, 从而可以处理残量.
+
+那么首先分析代码中的超级块是如何实现的.
+
+代码中, 每个写缓存有一个sblk属性表示超级块. 总共`ZNS_DEFAULT_NUM_WRITE_CACHE`个写缓存, 默认为3个(不知道这个数字是否需要改变, 后面再分析),
+每个写缓存的容量是`id_zns->stripe_unit/LOGICAL_PAGE_SIZE`,
+这里`stripe_unit`代表每个不同plane取出一个物理页构成的大小(这里的物理页是考虑flash_type的, 所以在代码中1个顶16个逻辑页).
+(参考`zns.c::zns_init_params`)
+所以写缓存和超级块的大小是对应的. 写缓存容量cap就是一个超级块的物理大小可以容纳的逻辑页lpn的数量.
+
+写缓存的sblk是可变的, 具体如何取值呢? 写缓存仅在写操作使用, 在`zns_write`函数中, 会假设已经设定好当前写操作的当前活跃zone(active zone), 并根据这个值找到或腾出一个写缓存(如果有写缓存的sblk==active_zone就直接使用, 如果没有, 则调用`zns_flush`清空相对最满的一个写缓存并将其sblk设置为active_zone).
+
+active_zone是在`zns.c::zns_nvme_rw`的末尾根据slba和zone大小设定的, 也就是在数据读写操作结束后.   - 
+ 
+
+
+子超级块0必然不能包含所有block0. 
 
 
 
