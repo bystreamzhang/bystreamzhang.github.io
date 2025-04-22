@@ -52,7 +52,7 @@ Balloon-ZNS对残量的处理也存在许多优化空间.
 
 2. 根据slba获得对应zone指针(使用`zns_get_zone_by_slba`函数).
 3. 通过`zns_check_zone_write`等函数初步检查这个请求是否合法, 比如zone是否装得下nlb个lb.
-4. 通过slba获得具体要读/写的内存逻辑地址.
+4. 通过slba获得具体要读/写的内存逻辑地址`data_offset`.
 5. 从req获取QEMUSGList信息, 包括每个sg的长度和总数量.
 6. 打包既有信息调用`backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);`函数进行实际的读/写.
 7. 对于写操作, 检查zns的新状态.
@@ -190,6 +190,18 @@ static inline struct zns_plane *get_plane(struct zns_ssd *zns, struct ppa *ppa)
 femu模拟器的硬件设置方式是, 在编译生成得到的运行脚本中(或者在`femu-scripts`中)修改诸如`SSD_SIZE_MB`等变量, 将作为参数传递.
 
 不过, 在代码内部也要匹配外部设置. 比如物理页ppa的各级位表示, 在代码中默认是给channel 2位, 这会导致代码内认定的物理页所在channel最多就是2种编号, 理论上会影响结果. 可以看我下面Balloon-ZNS复现中的一些记录.
+
+## 初始化
+
+QEMU运行时会对模拟的ZNS做一个初始化, 会调用`zns.c::zns_init`, 后续在虚拟机内就不会自行调用该函数了.
+
+ZNS SSD设备本身有诸如`nvme zns reset-zone $ZNS_PATH -a`或`blkzone reset $ZNS_PATH`等初始化命令(这里`$ZNS_PATH`是设备路径, 比如`/dev/nvme0n1`), 具体来说是在代码中的`zns_zone_mgmt_send`函数发送一个`NVME_ZONE_ACTION_RESET`请求, 并且all参数为1, 后续就会利用`zns_reset_zone`函数清空所有处于OPEN/CLOSED/FULL状态的zone的数据.
+
+注意区分两种初始化清空的内容. 后者是针对zone的, 所以`zns_init`设置的许多数据不会被初始化.
+
+但是可以修改`zns_zone_mgmt_send`函数对于RESET请求的处理, 使其可以初始化我们想初始化的内容, 从而在测试脚本中利用`nvme zns reset-zone $ZNS_PATH -a`等命令来初始化.
+
+而zns.c中诸如`zns_clear_zone`和`zns_zoned_ns_shutdown`这些看似也有初始化作用的函数, 不会被主动执行, 我目前也还不知道如何用命令来执行. 所以后续暂时不要在这些函数新增初始化操作.
 
 ## Balloon-ZNS思想
 
@@ -424,7 +436,7 @@ Q: 为什么呢?
 
 A: 我对CH_BITS=3和1的情况分别做YCSB测试, 额外统计每个pl全程的总延迟.
 测试时使用了六个负载和Balloon-ZNS的数据集, 结果发现对于同一个plane, 比如`ch=0 fc=0 pl=0`对应的plane, ch2个时的总延迟和写延迟大概就是ch8个时的4倍, 读延迟大概是2倍.
-不过偶然发现这个新增加的plane延迟计时器在多次测试中不会初始化, 我怀疑之前没做好测试间的初始化, 之后会弄清楚, 这里不提(**TODO**).
+不过偶然发现这个新增加的plane延迟计时器在多次测试中不会初始化, 我怀疑之前没做好测试间的初始化, 之后会弄清楚, 这里不提.
 
 主要是, 现在确定了YCSB的延迟计算是会受到CH_BITS影响的, 但不知道为什么对最终的测试结果没什么影响.
 我怀疑, 用来模拟的延迟并不是按我之前的理解--即, 并不是完全看plane的总延迟, 并不是plane数量翻倍性能就翻倍.
@@ -450,13 +462,13 @@ Q: 但是为什么实际传递的lat往往很小呢? 中间存在某种刷新重
 
 写缓存的sblk是可变的, 具体如何取值呢? 写缓存仅在写操作使用, 在`zns_write`函数中, 会假设已经设定好当前写操作的当前活跃zone(active zone), 并根据这个值找到或腾出一个写缓存(如果有写缓存的sblk==active_zone就直接使用, 如果没有, 则调用`zns_flush`清空相对最满的一个写缓存并将其sblk设置为active_zone).
 
-active_zone是在`zns.c::zns_nvme_rw`的末尾根据slba和zone大小设定的, 也就是在数据读写操作结束后.   - 
- 
+active_zone是在`zns.c::zns_nvme_rw`的末尾根据slba和zone大小设定的, 也就是在数据读写操作结束后.
 
+active_zone的值非常重要, 会决定分配的物理页ppa的blk. 而sblk仅仅是写缓存的一个标记信息, 只是对应一个zone并用来保证当前写缓存的请求全部都是针对该zone.
 
-子超级块0必然不能包含所有block0. 
+...
 
-
+注: 目前暂不继续考虑子超级块设计了
 
 ### 宏
 

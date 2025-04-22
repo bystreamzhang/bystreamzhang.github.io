@@ -107,11 +107,11 @@ make
 ```makefile
 # Extra options
 DEBUG_BUILD ?=
-EXTRA_CXXFLAGS ?= -I/home/spdk/Desktop/rocksdb/include
-EXTRA_LDFLAGS ?= -L/home/spdk/Desktop/rocksdb  -lsnappy -lzstd -lbz2 -llz4  -lgflags -u zenfs_filesystem_reg -lzbd
+EXTRA_CXXFLAGS ?= -I/home/ROCKSDB_PATH/rocksdb/include
+EXTRA_LDFLAGS ?= -L/home/ROCKSDB_PATH/rocksdb  -lsnappy -lzstd -lbz2 -llz4  -lgflags -u zenfs_filesystem_reg -lzbd
 ```
 
-接着修改 rocksdb/rocksdb_db.cc文件  
+接着修改YCSB-cpp的 rocksdb/rocksdb_db.cc文件  
 在RocksdbDB::GetOptions定义处加入如下代码
 
 ```c
@@ -135,7 +135,7 @@ opt->env = env;
 rocksdb.dbname=/
 rocksdb.format=single
 rocksdb.destroy=false
-rocksdb.fs_uri=zenfs://dev:nvme4n1
+rocksdb.fs_uri=zenfs://dev:nvme0n1
 # Load options from file
 #rocksdb.optionsfile=
 
@@ -212,4 +212,46 @@ rocksdb的测试脚本是有 `--compression_type=none`的。根据rocksdb_db.cc�
 python中要实现这个效果, 也需要一些额外操作, 具体见代码.
 
 我的这个数据生成和使用的总思路存在几个可能问题:1. 输入文件大小如果不够怎么办? 那就取模.如果大小过大, 超出部分就用不到. 2. run阶段的insert也会重头开始取输入数据, 这可能和实际测试存在差异, 本来这个insert结果不应该和load阶段的insert相同. 不过这种相同应该对测试效果无影响, 毕竟数据本身就是我们决定的, 插入什么也是我们定的. 这个问题其实也可以改正不过先就这样. 3. 我预处理出data, 相对来说可能还使insert时需要的时间变短了, 不过也有额外读取文件的耗时, 感觉影响应该不大.
+
+### 切换到新的rocksdb和zenfs版本(并且也得能切换回去)
+
+假设上面的已经成功, 目前有新的rocksdb和zenfs文件夹.
+
+首先需要把zenfs配置到rocksdb, 然后编译rocksdb, 参考<https://github.com/westerndigitalcorporation/zenfs>
+
+应该可以为不同版本rocksdb设定不同的路径, make时修改`PREFIX`指定路径而不是都安装到`user/local`. 测试时选择不同的路径即可选定不同的测试版本.
+
+具体来说(下面针对FlexZNS, 其他ZNS如果也修改了rocksdb和zenfs, 大体流程应该相同但是细节可能不同):
+
+- 将zenfs代码根目录放到rocksdb的plugin文件夹
+- 在rocksdb的代码根目录, 修改Makefile:
+
+```Makefile
+#PREFIX ?= /usr/local
+PREFIX ?= /home/zwl/FlexZNS-ICCD23-EA/Softwares/rocksdb/base
+```
+
+编译安装rocksdb:
+
+```bash
+DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs USE_RTTI=1 LDFLAGS="-lz" make -j$(nproc) librocksdb.a
+```
+
+如果遇到报错:`plugin/zenfs/zenfs.mk:37: *** Generating ZenFS version failed.  Stop.`则在zenfs文件夹中, 将`generate-version.sh`中的`VERSION`自定义为一个定值.
+
+在`plugin/zenfs/util`文件夹也做`make`.
+
+然后修改下面的文件:
+
+- YCSB-cpp的Makefile: `EXTRA_CXXFLAGS`和`EXTRA_LDFLAGS`改为新rocksdb的对应路径. 并且最好加上`-lz`(为了避免后面链接不到对应的库, 不知为何我不加会找不到某些函数)
+- 测试脚本my_test.sh中的zenfs路径要改为指向新rocksdb中的plugin中的zenfs
+
+然后在YCSB-cpp文件夹做make. 注意先做`make clean`.
+
+注意: rocksdb的make可能比较耗时, 并且生成内容比较大(几个G), 所以注意存储空间. 后续YCSB-cpp编译出ycsb执行程序后, rocksdb可以执行`make clean`来释放空间.
+
+这里可以编译出ycsb, 但是测试可能出现`Caught exception: RocksDB CreateFromUri: Invalid argument: Corruption: ZenFS Superblock: Error: block size missmatch: zenfs://dev:nvme0n1`的报错,
+分析认为应该是FlexZNS对rocksdb或zenfs的修改导致. 因为这个流程对于旧rocksdb是成立的.
+
+对ycsb指令用gdb调
 
