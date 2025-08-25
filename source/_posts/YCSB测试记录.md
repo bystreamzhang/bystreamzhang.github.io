@@ -215,6 +215,8 @@ python中要实现这个效果, 也需要一些额外操作, 具体见代码.
 
 ### 切换到新的rocksdb和zenfs版本(并且也得能切换回去)
 
+之前做FlexZNS和CCZNS测试时琢磨的，不一定正确。
+
 假设上面的已经成功, 目前有新的rocksdb和zenfs文件夹.
 
 首先需要把zenfs配置到rocksdb, 然后编译rocksdb, 参考<https://github.com/westerndigitalcorporation/zenfs>
@@ -252,6 +254,4 @@ DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs USE_RTTI=1 LDFLAGS="-lz" make -j$(nproc) lib
 
 这里可以编译出ycsb, 但是测试可能出现`Caught exception: RocksDB CreateFromUri: Invalid argument: Corruption: ZenFS Superblock: Error: block size missmatch: zenfs://dev:nvme0n1`的报错,
 分析认为应该是FlexZNS对rocksdb或zenfs的修改导致. 因为这个流程对于旧rocksdb是成立的.
-
-对ycsb指令用gdb调
 

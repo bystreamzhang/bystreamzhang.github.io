@@ -51,5 +51,4 @@ zwl师姐建议:
 
 ![系统架构图](Structure-bishe.drawio.png)
 
-功能模块图：
 

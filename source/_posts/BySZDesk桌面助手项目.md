@@ -4,7 +4,7 @@ hide: true
 date: 2025-03-03 21:12:23
 tags:
     - AI
-    - Tools
+    - Tool
     - Python
     - PySide6
     - Qt

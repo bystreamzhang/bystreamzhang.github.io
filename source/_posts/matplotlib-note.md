@@ -167,10 +167,10 @@ plt.show()
 
 输入文件我自己在输入前就规范了格式以方便处理，excel形式是这样的：
 
-![excel示意图](excel.png)
+![excel示意图](matplotlib-note/excel.png)
 
 很复杂的图也画出来了，确实是能满足复杂要求：
 
-![成果示意图](show1.png)
+![成果示意图](matplotlib-note/show1.png)
 
 熟悉代码就可以方便地做各种调整从而生成各种图片了。
