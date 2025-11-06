@@ -55,6 +55,17 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
 
+# 测试工具如db_bench相关配置(如果不使用，可注释)
+
+WORKDIR /opt/rocksdb
+RUN apt-get update && \
+    apt-get install -y libgflags-dev locales && \
+    locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 && \
+    export LANG=en_US.UTF-8
+RUN make clean
+RUN CXXFLAGS="-fPIC" make db_bench -j"$(nproc)"
+
 # 工作目录
 
 WORKDIR /work
@@ -62,13 +73,18 @@ WORKDIR /work
 RUN echo "RocksDB在/opt文件夹"
 ```
 
-RocksDB自带测试工具db_bench的编译：参考[db_bench教程](https://www.codeleading.com/article/16653770496/)
+RocksDB自带测试工具db_bench的编译参考了[db_bench教程](https://www.codeleading.com/article/16653770496/)
+-fPIC参数不加有问题，问ai后加的，不清楚具体为什么
 
 ## ZNS相关测试
 
 现在要在ZNS SSD上做RocksDB相关的测试，做些记录。
 
-需要做下面的测试：1. 逐层搜SSD的开销.最坏情况下，最长延迟，平均延迟99.9%尾延迟；2.单个SST中，检索具体kv对的开销；3.模型训练时间中，用新数据训练的时间和垃圾回收训练时间。
+需要做下面的测试：
+
+1. 逐层搜SSD的开销.最坏情况下，最长延迟，平均延迟99.9%尾延迟；
+2. 单个SST中，检索具体kv对的开销；
+3. 模型训练时间中，用新数据训练的时间和垃圾回收训练时间。
 
 旧的测试脚本：
 
@@ -280,3 +296,27 @@ Level Files Size(MB)
 
 我在服务器本机也做了测试(一般的SSD。在docker中的rocksdb测试)。
 
+```sh
+#!/bin/bash
+set -euo pipefail
+DB_DIR=${DB_DIR:-/opt/rocksdb/ZNBC/dbtest}
+WAL_DIR=${WAL_DIR:-/opt/rocksdb/ZNBC/dbtest/wal}
+mkdir -p "$DB_DIR" "$WAL_DIR"
+./db_bench \
+  --db="$DB_DIR" \
+  --wal_dir="$WAL_DIR" \
+  --benchmarks="fillseq,stats,sstables,levelstats" \
+  --num=2000000 \
+  --value_size=800 \
+  --key_size=16 \
+  --min_write_buffer_number_to_merge=2 \
+  --max_write_buffer_number=6 \
+  --write_buffer_size=67108864 \
+  --target_file_size_base=67108864 \
+  --max_background_flushes=4 \
+  --use_direct_io_for_flush_and_compaction \
+  --compression_type=none \
+  > dbtest_output.txt 2>&1
+```
+
+## 代码分析和修改
